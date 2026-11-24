@@ -13,6 +13,8 @@ import android.view.LayoutInflater
 import android.view.SurfaceView
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.ImageView
@@ -41,7 +43,10 @@ import androidx.recyclerview.widget.SimpleItemAnimator
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.net.HttpURLConnection
+import java.net.SocketTimeoutException
 import java.net.URL
+import java.net.UnknownHostException
+import javax.net.ssl.SSLException
 import kotlin.math.min
 
 class Ch(val name: String, val group: String?, val url: String)
@@ -111,6 +116,11 @@ class MainActivity : AppCompatActivity() {
     private var viewGroup: String? = null
     private var srcMsg = ""                               // thông báo của nguồn đang mở (đang tải / lỗi)
     private var listMsg = ""                              // thông báo của danh sách nguồn
+    private val webTried = HashSet<String>()              // nguồn đã thử mở bằng trình duyệt ẩn trong lần chạy này
+    private var web: WebView? = null
+    private var webToken = 0
+    @Volatile private var lastErr = ""
+    @Volatile private var lastHead = ""
 
     // ---- Phát ----
     private var playSrc = -1
@@ -241,6 +251,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         ui.removeCallbacksAndMessages(null)
+        cancelWeb()
         ++playToken
         player.release()
         super.onDestroy()
@@ -552,7 +563,26 @@ class MainActivity : AppCompatActivity() {
         return null
     }
 
+    private fun errText(e: Exception): String = when (e) {
+        is SSLException -> "lỗi chứng chỉ bảo mật"
+        is UnknownHostException -> "không tìm thấy máy chủ / mất mạng"
+        is SocketTimeoutException -> "quá thời gian chờ"
+        else -> e.javaClass.simpleName
+    }
+
+    // Ghi nhật ký chẩn đoán vào Android/data/com.example.iptvbox/files/debug.txt (để gửi cho người hỗ trợ khi nguồn lỗi)
+    private fun dlog(msg: String) {
+        try {
+            val f = getExternalFilesDir(null)?.let { File(it, "debug.txt") } ?: return
+            if (f.length() > 200_000) f.delete()
+            f.appendText(msg.replace('\n', ' ') + "\n", Charsets.UTF_8)
+        } catch (e: Exception) {
+        }
+    }
+
     private fun httpGetText(start: String): String? {
+        lastErr = ""
+        lastHead = ""
         var u = start
         for (hop in 0 until 10) {
             var c: HttpURLConnection? = null
@@ -565,11 +595,12 @@ class MainActivity : AppCompatActivity() {
                 c.setRequestProperty("Accept", "*/*")
                 val code = c.responseCode
                 if (code in 300..399) {
-                    val loc = c.getHeaderField("Location") ?: return null
+                    val loc = c.getHeaderField("Location")
+                    if (loc == null) { lastErr = "chuyển hướng lỗi (HTTP $code)"; return null }
                     u = URL(URL(u), loc).toString()
                     continue
                 }
-                if (code != 200) return null
+                if (code != 200) { lastErr = "HTTP $code"; return null }
                 val out = ByteArrayOutputStream()
                 val buf = ByteArray(8192)
                 c.inputStream.use { ins ->
@@ -583,9 +614,12 @@ class MainActivity : AppCompatActivity() {
                 if (isHtml(text)) {
                     val next = htmlRedirect(text, u)
                     if (next != null && hop < 9) { u = next; continue }
+                    lastErr = "trang web trung gian"
+                    lastHead = u + " :: " + text.trim().take(300)
                 }
                 return text
             } catch (e: Exception) {
+                lastErr = errText(e)
                 return null
             } finally {
                 try { c?.disconnect() } catch (e: Exception) {}
@@ -744,46 +778,149 @@ class MainActivity : AppCompatActivity() {
                 }
             }
             val text = httpGetText(s.url)
+            val err = lastErr
+            val head = lastHead
             runOnUiThread {
                 if (isFinishing) return@runOnUiThread
-                val stillHere = srcs.getOrNull(si)?.url == s.url
-                if (text == null || isHtml(text) || text.isBlank()) {
-                    if (!chanMap.containsKey(s.url)) srcMsg = "Không tải được nguồn này"
-                    else srcMsg = if (manual) "Không tải được, dùng bản đã lưu" else ""
-                } else if (isStreamPlaylist(text)) {
-                    // Link này là một luồng phát (không phải danh sách): coi như 1 kênh và phát luôn
-                    chanMap[s.url] = listOf(Ch(s.name, null, s.url))
-                    srcMsg = ""
-                    fetchedThisRun.add(s.url)
-                    if (stillHere && viewSrc == si && !active) playChannel(si, 0, false, true)
-                } else {
-                    fetchedThisRun.add(s.url)
-                    if (!(textHash[s.url] == text.hashCode() && chanMap.containsKey(s.url))) {
-                        val list = parseChannels(text)
-                        if (list.isEmpty()) {
-                            if (!chanMap.containsKey(s.url)) srcMsg = "Nguồn này không có kênh nào đọc được"
-                        } else {
-                            writeFile(srcCacheFile(s.url), text)
-                            textHash[s.url] = text.hashCode()
-                            chanMap[s.url] = list
-                            srcMsg = ""
-                            // Danh sách của nguồn đang phát có thể đổi thứ tự: dò lại vị trí kênh đang xem
-                            if (playSrc == si && playUrl != null) {
-                                val k = list.indexOfFirst { it.url == playUrl }
-                                if (k >= 0) playIdx = k
-                            }
-                        }
-                    } else if (manual) srcMsg = "Đã là bản mới nhất"
-                }
-                if (viewSrc == si && !fullscreen) {
-                    val keep = srcMsg
-                    render(manual || chanMap[s.url] == null)
-                    if (keep.isNotEmpty() && chanMap.containsKey(s.url)) {
-                        ui.postDelayed({ if (srcMsg == keep) { srcMsg = ""; if (!fullscreen) updatePath() } }, 4000L)
+                val bad = text == null || text.isBlank() || isHtml(text)
+                if (bad && (webTried.add(s.url) || manual)) {
+                    // Trang trung gian (JavaScript, nút "Tiếp tục"...): mở bằng trình duyệt ẩn để đi tới trang gốc
+                    if (!chanMap.containsKey(s.url)) {
+                        srcMsg = "Đang mở trang trung gian..."
+                        if (viewSrc == si && !fullscreen) render(false)
                     }
+                    webFetch(s.url) { t2 ->
+                        if (t2 == null) dlog(s.url + " | " + err + " | trình duyệt ẩn: không lấy được | " + head)
+                        else dlog(s.url + " | " + err + " | trình duyệt ẩn: OK (" + t2.length + " ký tự)")
+                        handleSourceText(s, t2 ?: text, manual, err)
+                    }
+                } else {
+                    if (bad) dlog(s.url + " | " + err + " | " + head)
+                    handleSourceText(s, text, manual, err)
                 }
             }
         }.start()
+    }
+
+    private fun handleSourceText(s: Src, text: String?, manual: Boolean, err: String) {
+        if (isFinishing) return
+        val si = srcs.indexOfFirst { it.url == s.url }
+        if (si < 0) return
+        if (text == null || isHtml(text) || text.isBlank()) {
+            val why = if (err.isNotEmpty()) " ($err)" else ""
+            srcMsg = if (!chanMap.containsKey(s.url)) "Không tải được nguồn này$why"
+                else if (manual) "Không tải được, dùng bản đã lưu$why" else ""
+        } else if (isStreamPlaylist(text)) {
+            // Link này là một luồng phát (không phải danh sách): coi như 1 kênh và phát luôn
+            chanMap[s.url] = listOf(Ch(s.name, null, s.url))
+            srcMsg = ""
+            fetchedThisRun.add(s.url)
+            if (viewSrc == si && !active) playChannel(si, 0, false, true)
+        } else {
+            fetchedThisRun.add(s.url)
+            if (!(textHash[s.url] == text.hashCode() && chanMap.containsKey(s.url))) {
+                val list = parseChannels(text)
+                if (list.isEmpty()) {
+                    if (!chanMap.containsKey(s.url)) srcMsg = "Nguồn này không có kênh nào đọc được"
+                    dlog(s.url + " | không có kênh đọc được | " + text.trim().take(200))
+                } else {
+                    writeFile(srcCacheFile(s.url), text)
+                    textHash[s.url] = text.hashCode()
+                    chanMap[s.url] = list
+                    srcMsg = ""
+                    // Danh sách của nguồn đang phát có thể đổi thứ tự: dò lại vị trí kênh đang xem
+                    if (playSrc == si && playUrl != null) {
+                        val k = list.indexOfFirst { it.url == playUrl }
+                        if (k >= 0) playIdx = k
+                    }
+                }
+            } else if (manual) srcMsg = "Đã là bản mới nhất"
+        }
+        if (viewSrc == si && !fullscreen) {
+            val keep = srcMsg
+            render(manual || chanMap[s.url] == null)
+            if (keep.isNotEmpty() && chanMap.containsKey(s.url)) {
+                ui.postDelayed({ if (srcMsg == keep) { srcMsg = ""; if (!fullscreen) updatePath() } }, 4000L)
+            }
+        }
+    }
+
+    // ---------- Trình duyệt ẩn: đi qua trang trung gian tới trang gốc ----------
+
+    private val extractJs = "(function(){try{var t='';var p=document.querySelector('pre');if(p)t=p.innerText;" +
+        "if(!t&&document.body)t=document.body.innerText;" +
+        "if(t&&(t.indexOf('#EXTM3U')>=0||t.indexOf('#EXTINF')>=0||/https?:\\/\\/\\S+\\.m3u8/i.test(t)))return t;}catch(e){}return '';})()"
+
+    private val clickJs = "(function(){var re=/(continue|tiếp tục|get link|lấy link|go to link|skip|truy cập|click here|bấm vào đây|nhấn vào đây|open link|download|tải xuống|verify|human)/i;" +
+        "var els=document.querySelectorAll('a,button,input[type=submit],input[type=button],div[role=button]');" +
+        "for(var i=0;i<els.length;i++){var e=els[i];var t=(e.innerText||e.value||'').trim();" +
+        "if(t.length>0&&t.length<40&&re.test(t)&&e.offsetParent!==null){e.click();return 1;}}return 0;})()"
+
+    private fun decodeJs(v: String?): String? {
+        if (v == null || v == "null") return null
+        return try {
+            val o = org.json.JSONTokener(v).nextValue()
+            if (o is String) o else null
+        } catch (e: Exception) { null }
+    }
+
+    private fun cancelWeb() {
+        ++webToken
+        val w = web ?: return
+        web = null
+        try { w.stopLoading(); w.loadUrl("about:blank"); w.destroy() } catch (e: Exception) {}
+    }
+
+    // Mở trang trong WebView ẩn, đợi trang tự chuyển hướng / thử bấm nút "Tiếp tục", lấy nội dung danh sách kênh.
+    // Tối đa ~35 giây. Không vượt được captcha.
+    private fun webFetch(pageUrl: String, done: (String?) -> Unit) {
+        cancelWeb()
+        val my = webToken
+        var finished = false
+        fun finish(t: String?) {
+            if (finished || my != webToken) return
+            finished = true
+            cancelWeb()
+            done(t)
+        }
+        try {
+            val w = WebView(this)
+            web = w
+            val st = w.settings
+            st.javaScriptEnabled = true
+            st.domStorageEnabled = true
+            st.userAgentString = UA
+            st.loadsImagesAutomatically = false
+            // Trang trả file (m3u/txt) dưới dạng tải xuống: lấy link tải rồi đọc bằng kết nối thường
+            w.setDownloadListener { url, _, _, _, _ ->
+                Thread {
+                    val t = httpGetText(url)
+                    ui.post { if (t != null && !isHtml(t) && t.isNotBlank()) finish(t) }
+                }.start()
+            }
+            w.webViewClient = WebViewClient()
+            w.loadUrl(pageUrl)
+            val probe = object : Runnable {
+                var n = 0
+                override fun run() {
+                    if (finished || my != webToken) return
+                    val cur = web ?: return
+                    n++
+                    cur.evaluateJavascript(extractJs) { v ->
+                        val t = decodeJs(v)
+                        if (!t.isNullOrEmpty()) {
+                            finish(t)
+                        } else if (!finished && my == webToken) {
+                            if (n % 2 == 0) cur.evaluateJavascript(clickJs, null)
+                            if (n < 14) ui.postDelayed(this, 2500L) else finish(null)
+                        }
+                    }
+                }
+            }
+            ui.postDelayed(probe, 2500L)
+        } catch (e: Throwable) {
+            finish(null)
+        }
     }
 
     // Phân tích file danh sách kênh: M3U chuẩn, hoặc từng dòng "Tên|link" / "Tên,link" / chỉ link
