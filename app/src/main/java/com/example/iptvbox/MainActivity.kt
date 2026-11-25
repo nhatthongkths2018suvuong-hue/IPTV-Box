@@ -29,6 +29,7 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.Tracks
 import androidx.media3.common.VideoSize
+import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.decoder.ffmpeg.FfmpegAudioRenderer
 import androidx.media3.exoplayer.DefaultLoadControl
@@ -79,6 +80,7 @@ class MainActivity : AppCompatActivity() {
         const val OSD_MS = 6000L
         const val MAX_RETRY = 5
         const val MAX_BYTES = 12_000_000
+        const val DIRECT_STREAM = "#EXT-X-TARGETDURATION:direct"   // dấu hiệu nội bộ: link là luồng phát
     }
 
     private val aspectNames = arrayOf("Tỉ lệ gốc", "Full cả 2 lề", "Kéo giãn lề ngang", "Kéo giãn lề dọc")
@@ -119,8 +121,15 @@ class MainActivity : AppCompatActivity() {
     private val webTried = HashSet<String>()              // nguồn đã thử mở bằng trình duyệt ẩn trong lần chạy này
     private var web: WebView? = null
     private var webToken = 0
-    @Volatile private var lastErr = ""
-    @Volatile private var lastHead = ""
+    private val errTL = ThreadLocal<String>()
+    private val headTL = ThreadLocal<String>()
+    private var lastErr: String
+        get() = errTL.get() ?: ""
+        set(v) { errTL.set(v) }
+    private var lastHead: String
+        get() = headTL.get() ?: ""
+        set(v) { headTL.set(v) }
+    @Volatile private var streamUa = UA                 // User-Agent dùng khi phát kênh hiện tại
 
     // ---- Phát ----
     private var playSrc = -1
@@ -155,7 +164,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        SslFix.install(this)
+        val sslInfo = SslFix.install(this)
         setContentView(R.layout.activity_main)
         prefs = getSharedPreferences("iptvbox", MODE_PRIVATE)
         root = findViewById(R.id.root)
@@ -187,6 +196,7 @@ class MainActivity : AppCompatActivity() {
             prefs.edit().putBoolean("ffmpeg_blocked", true).commit()
         }
 
+        dlog("SslFix: " + sslInfo)
         buildPlayer(false)
 
         rv.layoutManager = LinearLayoutManager(this)
@@ -271,11 +281,14 @@ class MainActivity : AppCompatActivity() {
             list.add(if (idx >= 0) idx else list.size, ff)
             list.toTypedArray()
         }
-        val http = DefaultHttpDataSource.Factory()
-            .setUserAgent(UA)
-            .setAllowCrossProtocolRedirects(true)
-            .setConnectTimeoutMs(15000)
-            .setReadTimeoutMs(15000)
+        val http = DataSource.Factory {
+            DefaultHttpDataSource.Factory()
+                .setUserAgent(streamUa)
+                .setAllowCrossProtocolRedirects(true)
+                .setConnectTimeoutMs(15000)
+                .setReadTimeoutMs(15000)
+                .createDataSource()
+        }
         val load = DefaultLoadControl.Builder()
             .setBufferDurationsMs(15000, 30000, 1500, 3000)
             .build()
@@ -580,15 +593,23 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // Một số máy chủ chặn theo User-Agent (403/400/429): thử lần lượt vài kiểu UA
+    // Một số máy chủ chặn (403/400/429) hoặc đưa trình duyệt về trang chủ: thử lần lượt vài kiểu User-Agent
     private fun httpGetText(start: String): String? {
         val uas = listOf(UA, "VLC/3.0.18 LibVLC/3.0.18", "curl/7.88.1")
-        for (ua in uas) {
+        var firstR: String? = null
+        var firstErr = ""
+        var firstHead = ""
+        for ((i, ua) in uas.withIndex()) {
             val r = httpGetOnce(start, ua)
-            if (r != null) return r
-            if (lastErr != "HTTP 403" && lastErr != "HTTP 400" && lastErr != "HTTP 429") return null
+            if (i == 0) { firstR = r; firstErr = lastErr; firstHead = lastHead }
+            if (r != null && !isHtml(r)) return r
+            val retry = if (r == null) (lastErr == "HTTP 403" || lastErr == "HTTP 400" || lastErr == "HTTP 429")
+                else (lastErr == "trang web trung gian" || lastErr.startsWith("link rút gọn"))
+            if (!retry) { if (i == 0) return r; break }
         }
-        return null
+        lastErr = firstErr
+        lastHead = firstHead
+        return firstR
     }
 
     private fun httpGetOnce(start: String, ua: String): String? {
@@ -612,6 +633,11 @@ class MainActivity : AppCompatActivity() {
                     continue
                 }
                 if (code != 200) { lastErr = "HTTP $code"; return null }
+                val ctype = (c.contentType ?: "").lowercase()
+                val upath = u.lowercase().substringBefore('?')
+                if (ctype.startsWith("video/") || ctype.startsWith("audio/") || ctype.contains("mp2t") ||
+                    (ctype.contains("octet-stream") && (upath.endsWith(".ts") || upath.endsWith(".mp4") || upath.endsWith(".flv") || upath.endsWith(".mkv")))
+                ) return DIRECT_STREAM   // luồng phát trực tiếp, không phải file danh sách: đừng tải cả luồng về như văn bản
                 val out = ByteArrayOutputStream()
                 val buf = ByteArray(8192)
                 c.inputStream.use { ins ->
@@ -1105,10 +1131,23 @@ class MainActivity : AppCompatActivity() {
 
     // ---------- Phát kênh ----------
 
-    private class Resolved(val url: String, val hls: Boolean)
+    private class Resolved(val url: String, val hls: Boolean, val ua: String, val good: Boolean = true)
+
+    private val streamUas = listOf(UA, "VLC/3.0.18 LibVLC/3.0.18", "okhttp/4.9.3")
+
+    // Thử lần lượt vài kiểu User-Agent: một số máy chủ đưa trình duyệt về trang chủ, chỉ trả luồng cho trình phát
+    private fun resolveUrl(start: String): Resolved {
+        var first: Resolved? = null
+        for (ua in streamUas) {
+            val r = resolveOnce(start, ua)
+            if (first == null) first = r
+            if (r.good) return r
+        }
+        return first!!
+    }
 
     // Đi theo các lần chuyển hướng để lấy link thật và biết có phải m3u8 không
-    private fun resolveUrl(start: String): Resolved {
+    private fun resolveOnce(start: String, ua: String): Resolved {
         var u = start
         for (hop in 0 until 8) {
             var c: HttpURLConnection? = null
@@ -1117,7 +1156,7 @@ class MainActivity : AppCompatActivity() {
                 c.instanceFollowRedirects = false
                 c.connectTimeout = 10000
                 c.readTimeout = 10000
-                c.setRequestProperty("User-Agent", UA)
+                c.setRequestProperty("User-Agent", ua)
                 val code = c.responseCode
                 if (code in 300..399) {
                     val loc = c.getHeaderField("Location") ?: break
@@ -1125,22 +1164,22 @@ class MainActivity : AppCompatActivity() {
                     continue
                 }
                 val byName = u.lowercase().substringBefore('?').endsWith(".m3u8")
-                if (code != 200) return Resolved(u, byName)
+                if (code != 200) return Resolved(u, byName, ua, false)
                 val ct = (c.contentType ?: "").lowercase()
-                var hls = byName || ct.contains("mpegurl")
-                if (!hls) {
-                    val buf = ByteArray(2048)
-                    val n = c.inputStream.read(buf)
-                    if (n > 0) hls = String(buf, 0, n, Charsets.ISO_8859_1).contains("#EXTM3U")
-                }
-                return Resolved(u, hls)
+                val buf = ByteArray(2048)
+                val n = try { c.inputStream.read(buf) } catch (e: Exception) { -1 }
+                val head = if (n > 0) String(buf, 0, n, Charsets.ISO_8859_1) else ""
+                if (isHtml(head)) return Resolved(u, byName, ua, false)    // bị đưa về trang web
+                val hls = byName || ct.contains("mpegurl") || head.contains("#EXTM3U")
+                return Resolved(u, hls, ua, true)
             } catch (e: Exception) {
-                return Resolved(u, u.lowercase().contains(".m3u8"))
+                // Lỗi mạng: thử kiểu UA khác cũng không khá hơn, để bộ phát tự thử
+                return Resolved(u, u.lowercase().contains(".m3u8"), ua, true)
             } finally {
                 try { c?.disconnect() } catch (e: Exception) {}
             }
         }
-        return Resolved(u, u.lowercase().contains(".m3u8"))
+        return Resolved(u, u.lowercase().contains(".m3u8"), ua, false)
     }
 
     private fun playChannel(si: Int, i: Int, auto: Boolean = false, goFull: Boolean = false) {
@@ -1184,6 +1223,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun startStream(r: Resolved) {
         try {
+            streamUa = r.ua
             val b = MediaItem.Builder().setUri(Uri.parse(r.url))
             if (r.hls) b.setMimeType(MimeTypes.APPLICATION_M3U8)
             player.setMediaItem(b.build())
