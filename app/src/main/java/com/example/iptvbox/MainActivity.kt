@@ -635,15 +635,23 @@ class MainActivity : AppCompatActivity() {
                 if (code != 200) { lastErr = "HTTP $code"; return null }
                 val ctype = (c.contentType ?: "").lowercase()
                 val upath = u.lowercase().substringBefore('?')
-                if (ctype.startsWith("video/") || ctype.startsWith("audio/") || ctype.contains("mp2t") ||
-                    (ctype.contains("octet-stream") && (upath.endsWith(".ts") || upath.endsWith(".mp4") || upath.endsWith(".flv") || upath.endsWith(".mkv")))
-                ) return DIRECT_STREAM   // luồng phát trực tiếp, không phải file danh sách: đừng tải cả luồng về như văn bản
+                // File danh sách M3U hay được trả với kiểu audio/x-mpegurl: KHÔNG được coi là luồng phát
+                val isListType = ctype.contains("mpegurl") || ctype.contains("m3u") || ctype.startsWith("text/")
+                if (!isListType && (ctype.startsWith("video/") || ctype.contains("mp2t") ||
+                    (ctype.contains("octet-stream") && (upath.endsWith(".ts") || upath.endsWith(".mp4") || upath.endsWith(".flv") || upath.endsWith(".mkv"))))
+                ) return DIRECT_STREAM   // luồng video trực tiếp: đừng tải cả luồng về như văn bản
                 val out = ByteArrayOutputStream()
                 val buf = ByteArray(8192)
                 c.inputStream.use { ins ->
                     while (out.size() < MAX_BYTES) {
                         val n = ins.read(buf)
                         if (n < 0) break
+                        // Dữ liệu nhị phân (có byte 0 ngay đầu) thì là luồng video, không phải danh sách văn bản
+                        if (out.size() == 0 && !isListType) {
+                            var bin = false
+                            for (k in 0 until minOf(n, 512)) if (buf[k] == 0.toByte()) { bin = true; break }
+                            if (bin) return DIRECT_STREAM
+                        }
                         out.write(buf, 0, n)
                     }
                 }
